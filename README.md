@@ -139,6 +139,22 @@ Arduino IDE expects.
 > `sdkconfig.ext` enables hardware MPI + NIST fast reduction — essential, the
 > firmware is ~5× slower without it.
 
+### Onboard RGB LED as a status indicator
+
+The board's built-in addressable LED shows this node's state at a glance (handy
+since you can only watch one Serial Monitor at a time):
+
+| LED | Meaning |
+|-----|---------|
+| **Blue / Green / Purple** | node identity — **D1 / D2 / D3** |
+| **Dim** | idle, does not hold the token |
+| **Bright** | currently holds the token |
+| **White flash** | this board just fired an event (deposit / pick-up) |
+
+Driven via the core's `rgbLedWrite()` on `RGB_BUILTIN` (GPIO48 on most ESP32-S3
+devkits). If your board's LED is on a different pin, override `RGB_LED_PIN` near
+the top of the LED section in the sketch.
+
 `SECURITY_FULL_RERANDOMIZE` defaults to `0` here (responsive demo). Set it to `1`
 for the research build that also re-randomizes every cell each transition.
 

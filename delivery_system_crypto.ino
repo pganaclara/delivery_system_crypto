@@ -545,6 +545,46 @@ static void drain_events() {
     }
 }
 
+// =============================================================================
+// Onboard RGB status LED (node identity + token + activity)
+// =============================================================================
+//
+// D1 = blue, D2 = green, D3 = purple.  Dim = idle / no token; full brightness =
+// this board currently holds the token; brief white flash = this board just
+// fired an event. Uses the ESP32 core's rgbLedWrite() on the built-in
+// addressable LED. Most ESP32-S3 devkits expose it as RGB_BUILTIN (GPIO48); if
+// your board uses a different pin, override RGB_LED_PIN below.
+#ifndef RGB_LED_PIN
+  #ifdef RGB_BUILTIN
+    #define RGB_LED_PIN RGB_BUILTIN
+  #else
+    #define RGB_LED_PIN 48
+  #endif
+#endif
+
+static uint8_t LED_R = 0, LED_G = 0, LED_B = 0;   // this node's identity colour
+
+static inline void led_rgb(uint8_t r, uint8_t g, uint8_t b) {
+    rgbLedWrite(RGB_LED_PIN, r, g, b);
+}
+// Identity colour: bright while holding the token, dimmed (~1/6) otherwise.
+static void led_identity(bool bright) {
+    if (bright) led_rgb(LED_R, LED_G, LED_B);
+    else        led_rgb(LED_R / 6, LED_G / 6, LED_B / 6);
+}
+static void led_flash() {            // brief white flash when an event fires
+    led_rgb(255, 255, 255);
+    delay(60);
+}
+static void led_init() {
+    switch (NODE_ID) {
+        case 1: LED_R = 0;   LED_G = 0;   LED_B = 255; break;  // D1 blue
+        case 2: LED_R = 0;   LED_G = 255; LED_B = 0;   break;  // D2 green
+        case 3: LED_R = 160; LED_G = 0;   LED_B = 255; break;  // D3 purple
+    }
+    led_identity(false);             // identity colour, dim (idle, no token)
+}
+
 // Fire OUR buffer-changing event locally and broadcast it to the other boards.
 static void fire_and_broadcast(int ev_gi) {
     uint32_t gseq = g_applied_gseq + 1;
@@ -553,6 +593,7 @@ static void fire_and_broadcast(int ev_gi) {
     g_applied_gseq = gseq;
     Msg m{ MSG_EVENT, (uint8_t)NODE_ID, 0, (uint8_t)ev_gi, gseq };
     send_msg(m);
+    led_flash(); led_identity(true);            // white blip, then back to bright (still holding token)
     Serial.printf("[FIRE] %s (gseq %u) broadcast → buffer enables: a1=%d a2=%d a3=%d\n",
                   nm, (unsigned)gseq, event_enabled(EV_A1), event_enabled(EV_A2), event_enabled(EV_A3));
 }
@@ -562,12 +603,14 @@ static void pass_token() {
     Msg m{ MSG_TOKEN, (uint8_t)NODE_ID, (uint8_t)next, 0xFF, g_applied_gseq };
     send_msg(m);
     g_have_token = false;
+    led_identity(false);                        // released the token → dim identity
     Serial.printf("[TOKEN] → node %d (gseq %u)\n\n", next, (unsigned)g_applied_gseq);
 }
 
 // One UAV duty cycle while we hold the token. Returns after the trip completes.
 static void run_uav_turn() {
     drain_events();
+    led_identity(true);                         // holding the token → bright identity
 
     // Safety: if the token says more events happened than we've applied, we are
     // behind (a broadcast was lost). Skip acting this turn to avoid acting on a
@@ -624,6 +667,7 @@ static void run_uav_turn() {
 void setup() {
     Serial.begin(115200);
     delay(1500);
+    led_init();                                 // show this board's identity colour immediately
     Serial.println("\n============================================");
     Serial.printf ("  Distributed Homomorphic DES — UAV %s (node %d)\n", ROLE.uav, NODE_ID);
     Serial.println("============================================");
