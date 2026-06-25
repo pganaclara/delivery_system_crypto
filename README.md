@@ -139,6 +139,21 @@ Arduino IDE expects.
 > `sdkconfig.ext` enables hardware MPI + NIST fast reduction — essential, the
 > firmware is ~5× slower without it.
 
+### SOLO test mode (single board, no ESP-NOW)
+
+To try the whole pipeline with **just one board**, set `SOLO_TEST` to `1` near the
+top of the sketch (or build with `-DSOLO_TEST=1`):
+
+```cpp
+#define SOLO_TEST 1
+```
+
+That board then plays all three UAV roles in turn (D1 → D2 → D3) on one shared
+encrypted buffer replica — no ESP-NOW, no other boards needed. The onboard RGB
+LED cycles through the role colours (blue/green/purple) as each UAV acts, with a
+white flash on every deposit/pick-up. Set it back to `0` for the real 3-board
+distributed run.
+
 ### Onboard RGB LED as a status indicator
 
 The board's built-in addressable LED shows this node's state at a glance (handy

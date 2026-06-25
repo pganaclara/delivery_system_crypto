@@ -80,10 +80,19 @@
 
 // >>> SET THIS PER BOARD <<<  (1 = D1, 2 = D2, 3 = D3). Or build with -DNODE_ID=2
 #ifndef NODE_ID
-#define NODE_ID 1
+#define NODE_ID 2
 #endif
 
 #define NUM_NODES 3
+
+// >>> SOLO TEST MODE <<<  Set to 1 to bench-test with a SINGLE board: this board
+// plays all three UAV roles (D1→D2→D3) in turn on one shared encrypted buffer
+// replica, with NO ESP-NOW and no other boards needed. The onboard LED cycles
+// through the role colours as each UAV acts. Set back to 0 for the real
+// distributed 3-board system. (Or build with -DSOLO_TEST=1.)
+#ifndef SOLO_TEST
+#define SOLO_TEST 0
+#endif
 
 // Simulated flight time (ms) for a UAV trip leg. Keeps the demo watchable.
 #define FLIGHT_MS        1500
@@ -564,6 +573,15 @@ static void drain_events() {
 
 static uint8_t LED_R = 0, LED_G = 0, LED_B = 0;   // this node's identity colour
 
+// Identity colour for a given node: D1 blue, D2 green, D3 purple.
+static void node_color(int node, uint8_t* r, uint8_t* g, uint8_t* b) {
+    switch (node) {
+        case 1: *r = 0;   *g = 0;   *b = 255; break;  // D1 blue
+        case 2: *r = 0;   *g = 255; *b = 0;   break;  // D2 green
+        case 3: *r = 160; *g = 0;   *b = 255; break;  // D3 purple
+        default:*r = *g = *b = 0;
+    }
+}
 static inline void led_rgb(uint8_t r, uint8_t g, uint8_t b) {
     rgbLedWrite(RGB_LED_PIN, r, g, b);
 }
@@ -572,16 +590,18 @@ static void led_identity(bool bright) {
     if (bright) led_rgb(LED_R, LED_G, LED_B);
     else        led_rgb(LED_R / 6, LED_G / 6, LED_B / 6);
 }
+// Show a specific node's colour (used in SOLO mode as roles take turns).
+static void led_node(int node, bool bright) {
+    uint8_t r, g, b; node_color(node, &r, &g, &b);
+    if (bright) led_rgb(r, g, b);
+    else        led_rgb(r / 6, g / 6, b / 6);
+}
 static void led_flash() {            // brief white flash when an event fires
     led_rgb(255, 255, 255);
     delay(60);
 }
 static void led_init() {
-    switch (NODE_ID) {
-        case 1: LED_R = 0;   LED_G = 0;   LED_B = 255; break;  // D1 blue
-        case 2: LED_R = 0;   LED_G = 255; LED_B = 0;   break;  // D2 green
-        case 3: LED_R = 160; LED_G = 0;   LED_B = 255; break;  // D3 purple
-    }
+    node_color(NODE_ID, &LED_R, &LED_G, &LED_B);
     led_identity(false);             // identity colour, dim (idle, no token)
 }
 
@@ -660,6 +680,46 @@ static void run_uav_turn() {
     pass_token();
 }
 
+#if SOLO_TEST
+// One full UAV cycle for `node`, acting on the single shared replica — no
+// ESP-NOW, no token. The loop calls this for node 1, 2, 3 in turn so a single
+// board exercises the whole warehouse → B → client pipeline.
+static void solo_turn(int node) {
+    const Role& r = ROLES[node];
+    led_node(node, true);                         // colour of the UAV taking its turn
+    char gate[16]; strncpy_P(gate, (const char*)pgm_read_ptr(&EVENT_NAMES[r.gate_gi]), 15); gate[15]=0;
+
+    if (!event_enabled(r.gate_gi)) {
+        Serial.printf("[HOLD] %s gate(%s) disabled — buffer blocks action\n", r.uav, gate);
+        delay(IDLE_HOLD_MS); led_node(node, false); return;
+    }
+    if ((int)(esp_random() % 100) >= READY_PCT) {
+        Serial.printf("[HOLD] %s not ready this turn\n", r.uav);
+        delay(IDLE_HOLD_MS); led_node(node, false); return;
+    }
+
+    if (r.emit_after_flight) {                     // D1: take off → fly → deposit (+1)
+        Serial.printf("[%s] take-off (a1) — flying to buffer...\n", r.uav);
+        delay(FLIGHT_MS);
+        he_step(r.buf_gi); g_applied_gseq++;
+        led_flash(); led_node(node, true);
+        Serial.printf("[FIRE] b1 (gseq %u) → buffer enables: a1=%d a2=%d a3=%d\n",
+                      (unsigned)g_applied_gseq, event_enabled(EV_A1), event_enabled(EV_A2), event_enabled(EV_A3));
+        Serial.printf("[%s] deposited package in buffer.\n", r.uav);
+    } else {                                       // D2/D3: pick up (−1) → fly → deliver
+        char ev[16]; strncpy_P(ev, (const char*)pgm_read_ptr(&EVENT_NAMES[r.buf_gi]), 15); ev[15]=0;
+        he_step(r.buf_gi); g_applied_gseq++;
+        led_flash(); led_node(node, true);
+        Serial.printf("[FIRE] %s (gseq %u) → buffer enables: a1=%d a2=%d a3=%d\n",
+                      ev, (unsigned)g_applied_gseq, event_enabled(EV_A1), event_enabled(EV_A2), event_enabled(EV_A3));
+        Serial.printf("[%s] picked up from buffer — flying to client...\n", r.uav);
+        delay(FLIGHT_MS);
+        Serial.printf("[%s] delivered to client.\n", r.uav);
+    }
+    led_node(node, false);
+}
+#endif  // SOLO_TEST
+
 // =============================================================================
 // Setup / loop
 // =============================================================================
@@ -669,11 +729,17 @@ void setup() {
     delay(1500);
     led_init();                                 // show this board's identity colour immediately
     Serial.println("\n============================================");
+#if SOLO_TEST
+    Serial.println("  Homomorphic DES — SOLO TEST (D1+D2+D3 on one board, no ESP-NOW)");
+#else
     Serial.printf ("  Distributed Homomorphic DES — UAV %s (node %d)\n", ROLE.uav, NODE_ID);
+#endif
     Serial.println("============================================");
 
     crypto_init();
+#if !SOLO_TEST
     espnow_init();
+#endif
 
     // Replicate the shared buffer supervisor (reduced, smallest) on every board.
     Serial.println("[INIT] loading shared buffer supervisor (encrypted replica)...");
@@ -683,12 +749,19 @@ void setup() {
     Serial.printf("[INIT] ready. buffer enables: a1=%d a2=%d a3=%d (empty: a2/a3 disabled)\n\n",
                   event_enabled(EV_A1), event_enabled(EV_A2), event_enabled(EV_A3));
 
+#if !SOLO_TEST
     // Node 1 starts holding the token.
     if (NODE_ID == 1) { g_have_token = true; g_token_gseq = 0; delay(800); }
+#endif
 }
 
 void loop() {
+#if SOLO_TEST
+    for (int node = 1; node <= NUM_NODES; ++node) solo_turn(node);
+    delay(300);
+#else
     drain_events();                  // keep replica synced even without the token
     if (g_have_token) run_uav_turn();
     else              delay(10);
+#endif
 }
