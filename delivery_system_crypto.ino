@@ -33,9 +33,9 @@
 // Model chosen: REPLICATED BUFFER + BROADCAST (leaderless).
 //   • Every board runs an identical encrypted replica of the buffer supervisor.
 //   • The only events that change the buffer are b1 (+1), a2 (−1), a3 (−1).
-//     Whenever one board fires such an event it BROADCASTS it (ESP-NOW); every
-//     board applies the same homomorphic transition, so all replicas stay in
-//     lock-step.
+//     Whenever one board fires such an event it sends it to all peers over the
+//     WiFi TCP mesh; every board applies the same homomorphic transition, so all
+//     replicas stay in lock-step.
 //   • A 1-token ring (node1→node2→node3→node1) serialises buffer mutations so
 //     the two consumers D2/D3 can never both decrement an empty buffer. The
 //     supervisor is *permissive* (it allows a2 AND a3 when B≥1); the token is
@@ -55,15 +55,14 @@
 //   • ESP32 Arduino core v3.x, board = "ESP32S3 Dev Module"
 //   • Drop  supervisor_data_delivery_system.h  AND  sdkconfig.ext  in this
 //     folder (already copied here).
-//   • No external libraries — esp_now + WiFi are in the core; crypto uses the
-//     core's bundled mbedTLS.
+//   • No external libraries — WiFi/TCP is in the core; crypto uses the core's
+//     bundled mbedTLS.
+//   • Set WIFI_SSID / WIFI_PASS (and the subnet octets) in the config block.
 //   • Flash all 3 boards, each with a different NODE_ID. Serial @ 115200.
 // =============================================================================
 
 #include <Arduino.h>
-#include <WiFi.h>
-#include <esp_now.h>
-#include <esp_wifi.h>
+#include <WiFi.h>            // also provides WiFiServer / WiFiClient (TCP)
 #include <esp_timer.h>
 #include <mbedtls/ecp.h>
 #include <mbedtls/bignum.h>
@@ -87,7 +86,7 @@
 
 // >>> SOLO TEST MODE <<<  Set to 1 to bench-test with a SINGLE board: this board
 // plays all three UAV roles (D1→D2→D3) in turn on one shared encrypted buffer
-// replica, with NO ESP-NOW and no other boards needed. The onboard LED cycles
+// replica, with NO networking and no other boards needed. The onboard LED cycles
 // through the role colours as each UAV acts. Set back to 0 for the real
 // distributed 3-board system. (Or build with -DSOLO_TEST=1.)
 #ifndef SOLO_TEST
@@ -102,10 +101,19 @@
 // Models real autonomy (battery / next package not always ready) and keeps the
 // two consumers D2/D3 from starving each other under a fixed token order.
 #define READY_PCT        65
-// ESP-NOW unicast/broadcast retry budget on send failure.
-#define ESPNOW_RETRIES   3
-// WiFi channel all boards must agree on for ESP-NOW.
-#define ESPNOW_CHANNEL   1
+// ── WiFi + TCP transport ─────────────────────────────────────────────────────
+// All three boards join the same WiFi access point and talk over a small TCP
+// mesh (each pair of boards keeps one connection). >>> SET YOUR AP CREDENTIALS <<<
+#define WIFI_SSID   "yourSSID"
+#define WIFI_PASS   "yourPassword"
+#define TCP_PORT    3333
+// Static IPs so the boards can find each other without any discovery. Set the
+// first three octets to match YOUR router's subnet (e.g. 192.168.0 or 192.168.1).
+// Each board gets  <subnet>.(NET_IP_BASE + NODE_ID), gateway <subnet>.1.
+#define NET_O1 192
+#define NET_O2 168
+#define NET_O3 1
+#define NET_IP_BASE 50            // node1=.51, node2=.52, node3=.53
 
 // ── Global event indices (must match EVENT_NAMES[] in the .h) ────────────────
 // .h order is sorted: a1=0, a2=1, a3=2, b1=3, b2=4, b3=5
@@ -163,7 +171,7 @@ struct Supervisor {
     std::vector<std::vector<uint8_t>> changes_if_one;
 };
 
-// ESP-NOW wire message (tiny — well under the 250-byte ESP-NOW limit).
+// Wire message — a fixed 8-byte frame sent over the TCP mesh.
 enum MsgType : uint8_t { MSG_EVENT = 1, MSG_TOKEN = 2 };
 struct __attribute__((packed)) Msg {
     uint8_t  type;    // MsgType
@@ -189,14 +197,13 @@ static Ciphertext               g_zero;            // canonical Enc(0) literal
 // Globals — distributed state
 // =============================================================================
 
-static const uint8_t BCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 static volatile bool     g_have_token    = false;
 static volatile uint32_t g_token_gseq    = 0;       // gseq carried by last token
 static uint32_t          g_applied_gseq  = 0;       // events applied to our replica
 static bool              g_uav_idle      = true;    // our UAV physical status
 
-// Small inbound ring buffer for events received via ESP-NOW (filled in ISR-ish
-// callback context, drained in loop()).
+// Small inbound ring buffer for events received from peers (filled by net_poll
+// in loop context, drained by drain_events()).
 struct EvIn { uint8_t ev; uint32_t gseq; };
 static volatile int  g_evq_head = 0, g_evq_tail = 0;
 static EvIn          g_evq[16];
@@ -477,8 +484,14 @@ static void crypto_init() {
 }
 
 // =============================================================================
-// ESP-NOW transport
+// WiFi + TCP transport (mesh)
 // =============================================================================
+//
+// Each pair of boards keeps a single TCP connection (lower NODE_ID connects to
+// higher; higher listens). Every Msg is written to all connected peers and
+// filtered on receipt — same broadcast-and-filter model as the ESP-NOW version,
+// so none of the coordination logic below had to change. Messages are fixed
+// 8-byte frames, so the reader just accumulates bytes until it has a whole Msg.
 
 static void enqueue_event(uint8_t ev, uint32_t gseq) {
     portENTER_CRITICAL_ISR(&g_q_mux);
@@ -494,10 +507,22 @@ static bool dequeue_event(EvIn* out) {
     return got;
 }
 
-// ESP-NOW receive callback (core v3.x signature).
-static void on_recv(const esp_now_recv_info_t* /*info*/, const uint8_t* data, int len) {
-    if (len != (int)sizeof(Msg)) return;
-    Msg m; memcpy(&m, data, sizeof(Msg));
+// One TCP link to a peer board (at most NUM_NODES-1 of them per board).
+struct Link {
+    WiFiClient cli;
+    uint8_t    buf[sizeof(Msg)];
+    uint8_t    have    = 0;       // bytes accumulated toward the next 8-byte frame
+    bool       outgoing = false;  // true = we connect out (to a higher NODE_ID)
+    uint8_t    peer     = 0;      // target NODE_ID (outgoing links only)
+};
+static Link    g_links[NUM_NODES - 1];
+static int     g_nlinks = 0;
+static WiFiServer g_server(TCP_PORT);
+
+static IPAddress node_ip(int id) { return IPAddress(NET_O1, NET_O2, NET_O3, NET_IP_BASE + id); }
+
+// Handle one fully-received 8-byte Msg.
+static void handle_msg(const Msg& m) {
     if (m.type == MSG_EVENT) {
         enqueue_event(m.ev, m.gseq);
     } else if (m.type == MSG_TOKEN && m.dst == NODE_ID) {
@@ -506,27 +531,83 @@ static void on_recv(const esp_now_recv_info_t* /*info*/, const uint8_t* data, in
     }
 }
 
+// Send a Msg to every connected peer (broadcast-and-filter, like ESP-NOW).
 static void send_msg(const Msg& m) {
-    for (int i = 0; i < ESPNOW_RETRIES; ++i) {
-        if (esp_now_send(BCAST, (const uint8_t*)&m, sizeof(m)) == ESP_OK) return;
-        delay(2);
+    for (int i = 0; i < g_nlinks; ++i)
+        if (g_links[i].cli.connected())
+            g_links[i].cli.write((const uint8_t*)&m, sizeof(m));
+}
+
+// Accept incoming connections and (re)connect outgoing ones; read any data.
+static void net_poll() {
+    // Accept an incoming connection into a free incoming slot.
+    WiFiClient inc = g_server.accept();
+    if (inc) {
+        bool placed = false;
+        for (int i = 0; i < g_nlinks; ++i) {
+            if (!g_links[i].outgoing && !g_links[i].cli.connected()) {
+                g_links[i].cli = inc; g_links[i].have = 0; placed = true; break;
+            }
+        }
+        if (!placed) inc.stop();   // no room (shouldn't happen with 3 nodes)
+    }
+
+    // Reconnect any dropped outgoing links (non-blocking-ish; short timeout).
+    static uint32_t last_try = 0;
+    if (millis() - last_try > 1000) {
+        last_try = millis();
+        for (int i = 0; i < g_nlinks; ++i) {
+            Link& L = g_links[i];
+            if (L.outgoing && !L.cli.connected()) {
+                if (L.cli.connect(node_ip(L.peer), TCP_PORT, 300)) {
+                    L.have = 0;
+                    Serial.printf("[NET] connected to node %d\n", L.peer);
+                }
+            }
+        }
+    }
+
+    // Drain readable bytes from every link, assembling 8-byte frames.
+    for (int i = 0; i < g_nlinks; ++i) {
+        Link& L = g_links[i];
+        while (L.cli.connected() && L.cli.available()) {
+            L.buf[L.have++] = (uint8_t)L.cli.read();
+            if (L.have == sizeof(Msg)) {
+                Msg m; memcpy(&m, L.buf, sizeof(Msg));
+                handle_msg(m);
+                L.have = 0;
+            }
+        }
     }
 }
 
-static void espnow_init() {
+static void wifi_init() {
     WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-    if (esp_now_init() != ESP_OK) { Serial.println("[FATAL] esp_now_init failed"); while (true) delay(1000); }
-    esp_now_register_recv_cb(on_recv);
-    esp_now_peer_info_t peer = {};
-    memcpy(peer.peer_addr, BCAST, 6);
-    peer.channel = ESPNOW_CHANNEL;
-    peer.encrypt = false;
-    esp_now_add_peer(&peer);
-    uint8_t mac[6]; WiFi.macAddress(mac);
-    Serial.printf("[ESP-NOW] node %d  MAC %02X:%02X:%02X:%02X:%02X:%02X  channel %d\n",
-                  NODE_ID, mac[0],mac[1],mac[2],mac[3],mac[4],mac[5], ESPNOW_CHANNEL);
+    WiFi.config(node_ip(NODE_ID), IPAddress(NET_O1, NET_O2, NET_O3, 1),
+                IPAddress(255, 255, 255, 0));
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.printf("[WiFi] connecting to \"%s\" as %s ...\n",
+                  WIFI_SSID, node_ip(NODE_ID).toString().c_str());
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { delay(250); Serial.print('.'); }
+    Serial.println();
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[FATAL] WiFi connect failed — check SSID/PASS and subnet octets");
+        while (true) delay(1000);
+    }
+    Serial.printf("[WiFi] connected, IP %s\n", WiFi.localIP().toString().c_str());
+
+    g_server.begin();
+    g_server.setNoDelay(true);
+
+    // Set up the link table: connect out to every higher NODE_ID; the rest of
+    // the slots are filled by incoming connections from lower NODE_IDs.
+    g_nlinks = 0;
+    for (int j = 1; j <= NUM_NODES; ++j)
+        if (j > NODE_ID) { g_links[g_nlinks].outgoing = true; g_links[g_nlinks].peer = j; g_nlinks++; }
+    for (int j = 1; j <= NUM_NODES; ++j)
+        if (j < NODE_ID) { g_links[g_nlinks].outgoing = false; g_nlinks++; }
+    Serial.printf("[NET] node %d  TCP port %d  links=%d\n", NODE_ID, TCP_PORT, g_nlinks);
 }
 
 // =============================================================================
@@ -730,7 +811,7 @@ void setup() {
     led_init();                                 // show this board's identity colour immediately
     Serial.println("\n============================================");
 #if SOLO_TEST
-    Serial.println("  Homomorphic DES — SOLO TEST (D1+D2+D3 on one board, no ESP-NOW)");
+    Serial.println("  Homomorphic DES — SOLO TEST (D1+D2+D3 on one board, no network)");
 #else
     Serial.printf ("  Distributed Homomorphic DES — UAV %s (node %d)\n", ROLE.uav, NODE_ID);
 #endif
@@ -738,7 +819,7 @@ void setup() {
 
     crypto_init();
 #if !SOLO_TEST
-    espnow_init();
+    wifi_init();
 #endif
 
     // Replicate the shared buffer supervisor (reduced, smallest) on every board.
@@ -750,8 +831,18 @@ void setup() {
                   event_enabled(EV_A1), event_enabled(EV_A2), event_enabled(EV_A3));
 
 #if !SOLO_TEST
+    // Let the TCP mesh come up before anyone acts (so the first token/event
+    // isn't sent into a not-yet-connected link).
+    Serial.println("[NET] waiting for peer links...");
+    uint32_t t0 = millis();
+    while (millis() - t0 < 10000) {
+        net_poll();
+        int up = 0; for (int i = 0; i < g_nlinks; ++i) if (g_links[i].cli.connected()) up++;
+        if (up == g_nlinks) { Serial.println("[NET] all peer links up"); break; }
+        delay(50);
+    }
     // Node 1 starts holding the token.
-    if (NODE_ID == 1) { g_have_token = true; g_token_gseq = 0; delay(800); }
+    if (NODE_ID == 1) { g_have_token = true; g_token_gseq = 0; }
 #endif
 }
 
@@ -760,6 +851,7 @@ void loop() {
     for (int node = 1; node <= NUM_NODES; ++node) solo_turn(node);
     delay(300);
 #else
+    net_poll();                      // accept/reconnect peers, read incoming Msgs
     drain_events();                  // keep replica synced even without the token
     if (g_have_token) run_uav_turn();
     else              delay(10);

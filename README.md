@@ -75,21 +75,28 @@ here is identical.
 
 ## How the three boards coordinate
 
-**Link: ESP-NOW** — Espressif's connectionless Wi-Fi-layer protocol. No router, no
-broker, ~5 ms latency, native broadcast. The *same* sketch is flashed to all three
-boards and they only need the **broadcast** peer (`FF:FF:FF:FF:FF:FF`), so you do
-**not** hard-code each other's MAC addresses. All boards must share one Wi-Fi
-channel (`ESPNOW_CHANNEL`, default 1). **No wiring between boards** — each just needs
-power and its antenna.
+**Link: WiFi + TCP mesh.** All three boards join the same WiFi access point and
+form a small TCP mesh — each *pair* of boards keeps one TCP connection (the lower
+`NODE_ID` connects out, the higher one listens). Every message is written to all
+connected peers and filtered on receipt, so the coordination model is exactly the
+same broadcast-and-filter logic as before; only the wire changed. **No wiring
+between boards** (it's WiFi), but unlike ESP-NOW it does need an access point and
+a little config — see *Build & flash* below:
+
+* `WIFI_SSID` / `WIFI_PASS` — your access point.
+* Subnet octets `NET_O1/2/3` + `NET_IP_BASE` — each board takes a **static IP**
+  `<subnet>.(NET_IP_BASE + NODE_ID)` so the boards find each other with no
+  discovery. Set the octets to match your router (e.g. `192.168.0` or `192.168.1`).
+* `TCP_PORT` — the mesh port (default 3333).
 
 **Coordination model: replicated buffer + broadcast + 1-token ring**
 
 * **Replicated state** — every board holds an identical encrypted replica of the
   3-state buffer supervisor.
 * **Broadcast sync** — the only events that change the buffer are `b1` (+1),
-  `a2` (−1), `a3` (−1). When a board fires one it broadcasts `MSG_EVENT` with a
-  monotone sequence number; every board applies the same homomorphic transition,
-  keeping replicas in lock-step.
+  `a2` (−1), `a3` (−1). When a board fires one it sends `MSG_EVENT` (an 8-byte TCP
+  frame) to all peers with a monotone sequence number; every board applies the
+  same homomorphic transition, keeping replicas in lock-step.
 * **Token ring** (`node1 → node2 → node3 → node1`) serializes buffer mutations —
   the physical mutual-exclusion that the *permissive* supervisor (which allows both
   `a2` and `a3` when `B ≥ 1`) deliberately does not impose. A board holding the
@@ -126,20 +133,32 @@ Arduino IDE expects.
 
 1. Open `delivery_system_crypto.ino` (this folder) in the Arduino IDE.
 2. Board: **ESP32S3 Dev Module**; defaults are fine; Serial Monitor @ **115200**.
-3. Flash each of the three boards with a **different NODE_ID**. Either edit the line
-   near the top of the sketch:
+3. **Set the WiFi config** in the config block near the top of the sketch:
+   ```cpp
+   #define WIFI_SSID "yourSSID"
+   #define WIFI_PASS "yourPassword"
+   #define NET_O1 192   // ── match your router's subnet
+   #define NET_O2 168   //    e.g. 192.168.1.x  ->  192,168,1
+   #define NET_O3 1
+   ```
+   Each board auto-takes the static IP `<subnet>.(50 + NODE_ID)` (node1=.51, etc.).
+4. Flash each of the three boards with a **different NODE_ID**. Either edit:
    ```cpp
    #define NODE_ID 1     // 1 = D1, 2 = D2, 3 = D3
    ```
    or pass a build flag `-DNODE_ID=2`.
-4. Power all three. Node 1 starts holding the token. Watch the Serial Monitors —
-   `[FIRE]`, `[SYNC]`, `[TOKEN]` lines show packages flowing warehouse → B → client
-   while the encrypted buffer enables update.
+5. Power all three. They join the AP, form the TCP mesh (`[NET] all peer links up`),
+   then node 1 starts holding the token. Watch the Serial Monitors — `[FIRE]`,
+   `[SYNC]`, `[TOKEN]` lines show packages flowing warehouse → B → client while the
+   encrypted buffer enables update.
+
+> All three boards must be on the **same WiFi network/subnet**, and the subnet
+> octets in the sketch must match it, or they won't find each other.
 
 > `sdkconfig.ext` enables hardware MPI + NIST fast reduction — essential, the
 > firmware is ~5× slower without it.
 
-### SOLO test mode (single board, no ESP-NOW)
+### SOLO test mode (single board, no networking)
 
 To try the whole pipeline with **just one board**, set `SOLO_TEST` to `1` near the
 top of the sketch (or build with `-DSOLO_TEST=1`):
@@ -149,7 +168,7 @@ top of the sketch (or build with `-DSOLO_TEST=1`):
 ```
 
 That board then plays all three UAV roles in turn (D1 → D2 → D3) on one shared
-encrypted buffer replica — no ESP-NOW, no other boards needed. The onboard RGB
+encrypted buffer replica — no WiFi, no other boards needed. The onboard RGB
 LED cycles through the role colours (blue/green/purple) as each UAV acts, with a
 white flash on every deposit/pick-up. Set it back to `0` for the real 3-board
 distributed run.
@@ -234,10 +253,9 @@ python tools\sim_protocol.py
 - *Overview of Networked Supervisory Control with Imperfect Communication Channels*.
   https://arxiv.org/pdf/2010.11491
 
-**ESP-NOW**
-- ESP-NOW via Arduino. https://docs.arduino.cc/tutorials/nano-esp32/esp-now/
-- Getting Started with ESP-NOW (ESP32 + Arduino IDE), Random Nerd Tutorials.
-  https://randomnerdtutorials.com/esp-now-esp32-arduino-ide/
+**WiFi / TCP on ESP32 (Arduino)**
+- Arduino-ESP32 WiFi (`WiFiClient` / `WiFiServer`) API reference.
+  https://docs.espressif.com/projects/arduino-esp32/en/latest/api/wifi.html
 
 **Crypto / tooling**
 - ElGamal, T. (1985). *A public key cryptosystem and a signature scheme based on
@@ -248,5 +266,5 @@ python tools\sim_protocol.py
 ---
 
 *Homomorphic DES core adapted from the ESP32 UltraDES homomorphic supervisor
-project; distributed ESP-NOW coordination layer and the delivery-system model added
-here.*
+project; distributed WiFi/TCP coordination layer and the delivery-system model
+added here.*
